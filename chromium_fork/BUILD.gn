@@ -1,0 +1,336 @@
+# Copyright 2026 Dchromium_fork
+# VirtualEnvironmentManager: centralized simulation profile management.
+#
+# 2026-07-27 maintenance revision:
+#   - VEM render_seed/WebGL variant integration is retired. Canvas test noise
+#                                uses CanvasTestSessionSeedManager instead.
+#   - render_seed_store         : test-only persistence fixture; it is not part
+#                                of the production VEM source set.
+#   - render_fingerprint      : TEST-ONLY pure-function generator. Lives in
+#                                its own source set with tight visibility;
+#                                NEVER linked into Blink / ANGLE / content
+#                                / chrome production targets.
+#   - render_fingerprint_unittests, render_seed_store_unittests : test
+#                                targets that pull the engines in; not
+#                                built in official chrome.
+# Maintenance boundary revision (2026-07-25 22:XX):
+#   - canvas_noise_engine     : pure-function engine, no production deps.
+#   - canvas_test_bitmap_support : test-only SkBitmap helper, NEVER linked
+#                                  into production targets (blink_modules,
+#                                  blink_core, content, chrome).
+#   - chromium_fork_noise_engine_unittests : gtest target that pulls in
+#                                  the engine and the bitmap helper.
+#   - canvas_readback_noise   : legacy VEM/glue (kept for the existing
+#                                  SessionSeedManager wiring; still
+#                                  compiled in but no Blink integration
+#                                  is wired up after the maintenance
+#                                  rollback).
+
+import("//build/buildflag_header.gni")
+import("//testing/test.gni")
+
+declare_args() {
+  # Test-only deterministic noise engine for canvas / webgl readbacks.
+  # Default: false (no noise). When true, the engine .cc and the
+  # test-support helper are compiled; their test target is also declared.
+  enable_canvas_test_noise = false
+}
+
+# Official Build policy: no test artifacts, no Mojo fields, no runtime
+# hot-path checks. Force the gate closed regardless of any other input.
+if (is_official_build) {
+  enable_canvas_test_noise = false
+}
+
+# Public header that exposes the build flag via the standard BUILDFLAG
+# macro. Generated at build time by write_buildflag_header.py; included
+# via "chromium_fork/chromium_fork_buildflags.h" from any target that
+# adds the ":enable_canvas_test_noise" config below.
+buildflag_header("chromium_fork_buildflags") {
+  header = "chromium_fork_buildflags.h"
+  flags = [ "ENABLE_CANVAS_TEST_NOISE=$enable_canvas_test_noise" ]
+}
+
+# Public config so downstream targets can opt-in to the preprocessor
+# define and the generated header. This is the only reliable way to
+# propagate the flag across GN target boundaries.
+config("enable_canvas_test_noise") {
+  # No defines here — the buildflag header (chromium_fork_buildflags.h)
+  # already provides the canonical BUILDFLAG_INTERNAL_* macros.
+}
+
+# Minimal switches target, broken out so that canvas_session_seed_manager
+# can depend on it without pulling in the full VEM / canvas_readback_noise
+# source set (the full set needs canvas_session_seed_manager, creating a
+# cycle if they were one target).
+source_set("chromium_fork_switches") {
+  visibility = [
+    "//chromium_fork/*",
+    "//content/renderer/*",
+  ]
+  sources = [
+    "switches.cc",
+    "switches.h",
+  ]
+  deps = [ "//base" ]
+}
+
+# Internal source set owning the noise engine and the VEM stack.
+# Visibility is public so Blink targets can list it as a dependency
+# (the headers are needed at compile time in Blink).
+source_set("chromium_fork") {
+  visibility = [
+    "//chrome/browser/*",
+    "//chromium_fork/*",
+    "//components/embedder_support/*",
+    "//components/permissions/*",
+    "//content/*",
+    "//third_party/blink/renderer/*",
+  ]
+
+  sources = [
+    "canvas_readback_noise.cc",
+    "canvas_readback_noise.h",
+    "virtual_environment_manager.cc",
+    "virtual_environment_manager.h",
+  ]   
+
+  if (enable_canvas_test_noise) {
+    sources += [
+      "canvas_noise_engine.cc",
+      "canvas_noise_engine.h",
+      "webgl_readback_noise.cc",
+      "webgl_readback_noise.h",
+    ]
+  }
+
+  public_deps = [
+    ":chromium_fork_buildflags",
+    ":chromium_fork_switches",
+  ]
+  deps = [
+    ":canvas_anti_fraud",
+    ":canvas_anti_fraud_seed_store",
+    ":canvas_session_seed_manager",
+    "//base",
+    "//skia",
+    "//url",
+  ]
+
+  # Pick up the buildflag - this also exposes the define to the source
+  # files in this source_set.
+  public_configs = [ ":enable_canvas_test_noise" ]
+}
+
+# SessionSeedManager is its own source_set so that the test target can
+# depend on it without dragging in the VEM glue.
+# 2026-07-26: visibility expanded to allow //content/* so that
+# content_main_runner_impl.cc can call GetInstance()->InitializeFromCommandLine()
+# from the browser process start path. Without this, gn check fails and
+# the link either fails or silently drops the symbol, leaving IsEnabled()
+# stuck false at runtime.
+source_set("canvas_session_seed_manager") {
+  visibility = [
+    "//chromium_fork/*",
+    "//content/*",
+  ]
+
+  if (enable_canvas_test_noise) {
+    sources = [
+      "canvas_session_seed_manager.cc",
+      "canvas_session_seed_manager.h",
+    ]
+  }
+
+  deps = [
+    ":canvas_anti_fraud_seed_store",
+    ":chromium_fork_switches",
+    "//base",
+    "//url",
+  ]
+}
+
+# Test-only bitmap helper. Tightly scoped visibility list: only the
+# test target below may link this. Blink / chrome / content are NOT in
+# the list, so production targets cannot accidentally pull it in.
+source_set("canvas_test_bitmap_support") {
+  visibility = [
+    "//chromium_fork:chromium_fork_noise_engine_unittests",
+  ]
+
+  if (enable_canvas_test_noise) {
+    sources = [
+      "test_support/canvas_test_bitmap.cc",
+      "test_support/canvas_test_bitmap.h",
+    ]
+  }
+
+  deps = [
+    ":chromium_fork",
+    "//base",
+    "//skia",
+  ]
+}
+
+# Canvas anti-fraud seed store (2026-07-26).
+# Persistent JSON layer that resolves the effective canvas anti-fraud
+# seed (CLI > JSON > Rand). This is the only persistence path used by the
+# Canvas test-noise configuration and is intentionally independent of the
+# retired VEM render seed. It lives in a separate source set so the
+# chromium_fork:chromium_fork
+# source set's dependency graph stays clean (no cycle on canvas_session_
+# seed_manager -> chromium_fork_switches -> chromium_fork).
+source_set("canvas_anti_fraud_seed_store") {
+  visibility = [
+    "//chromium_fork/*",
+    "//content/renderer/*",
+    "//third_party/blink/renderer/core/*",
+    "//third_party/blink/renderer/modules/*",
+  ]
+  sources = [
+    "canvas_anti_fraud_seed_store.cc",
+    "canvas_anti_fraud_seed_store.h",
+  ]
+  deps = [ "//base" ]
+}
+
+# Canvas anti-fraud algorithm + per-site farble seed derivation
+# (2026-07-26, audit-revised). Production path that ships in the fork
+# binary and is reachable from Blink. Visibility is intentionally narrow
+# (audit #22): only the Blink modules that actually call into the noise
+# hook (core/html/canvas and modules/canvas/canvas2d) may link this
+# target. The top-level //third_party/blink/renderer/* wildcard is
+# deliberately omitted so the rest of Blink cannot reach fork code.
+source_set("canvas_anti_fraud") {
+  visibility = [
+    "//chromium_fork/*",
+    "//third_party/blink/renderer/core/*",
+    "//third_party/blink/renderer/modules/*",
+  ]
+  sources = [
+    "canvas_anti_fraud.cc",
+    "canvas_anti_fraud.h",
+    "farble_seed.cc",
+    "farble_seed.h",
+  ]
+  deps = [
+    ":canvas_session_seed_manager",
+    ":chromium_fork_buildflags",
+    ":chromium_fork_switches",
+    "//base",
+    "//skia",
+  ]
+  public_configs = [ ":enable_canvas_test_noise" ]
+}
+
+# Phase P7 (2026-07-25): gtest target for the noise engine. Only declared
+# when the feature is enabled in the current build configuration - this
+# keeps Official Builds test-free.
+if (enable_canvas_test_noise) {
+  test("chromium_fork_noise_engine_unittests") {
+    sources = [
+      "canvas_noise_engine_unittest.cc",
+    ]
+    deps = [
+      ":canvas_session_seed_manager",
+      ":canvas_test_bitmap_support",
+      ":chromium_fork",
+      "//base/test:run_all_unittests",
+      "//skia",
+      "//testing/gtest",
+    ]
+    defines = [ "ENABLE_CANVAS_TEST_NOISE=1" ]
+  }
+}
+
+# ============================================================================
+# 2026-07-26: RenderFingerprint test-only boundary.
+#
+# render_fingerprint is a TEST-ONLY pure-function generator. It is never
+# wired into production Blink / ANGLE / content / chrome targets. To make
+# this boundary enforceable, the engine itself lives in its own source set
+# with visibility restricted to the dedicated gtest target. Any future
+# include from Blink / canvas_readback_noise / content_main_runner_impl
+# would fail the GN visibility check at build time.
+#
+# RenderSeedStore is retained only as a test fixture for historical seed
+# persistence tests. It is deliberately not linked into VEM or production
+# rendering targets, because CanvasTestSessionSeedManager is the active
+# Canvas-test seed owner.
+# ============================================================================
+source_set("render_fingerprint_test_support") {
+  visibility = [
+    ":chromium_fork_render_fingerprint_unittests",
+    ":render_seed_store_unittests",
+  ]
+  sources = [
+    "render_fingerprint.cc",
+    "render_fingerprint.h",
+    "render_seed_store.cc",
+    "render_seed_store.h",
+  ]
+  deps = [
+    "//base",
+  ]
+}
+
+# Test target for the render_fingerprint pure-function engine. Mirrors
+# chromium_fork_noise_engine_unittests in spirit; declared unconditionally
+# so callers can `autoninja -C out/Default chromium_fork_render_fingerprint_unittests`
+# regardless of the enable_canvas_test_noise gate. The test target is
+# itself a test-only OnDeviceRunner target, so it does not show up in
+# official chrome builds.
+test("chromium_fork_render_fingerprint_unittests") {
+  sources = [
+    "render_fingerprint_unittest.cc",
+  ]
+  deps = [
+    ":render_fingerprint_test_support",
+    ":chromium_fork",
+    "//base/test:run_all_unittests",
+    "//testing/gtest",
+  ]
+}
+
+# Test target for the render_seed_store persistence layer. Covers the
+# failure modes called out in the 2026-07-26 audit:
+#   - CLI seed parsing failure (invalid string)
+#   - explicit CLI seed == 0 (force disabled)
+#   - JSON missing / corrupted / forward-incompatible schema
+#   - missing user_data_dir
+#   - concurrent first-touch (different pid temp files)
+#   - .bak backup on parse failure
+# Declared unconditionally so production-bound shell scripts can run it.
+test("render_seed_store_unittests") {
+  sources = [
+    "render_seed_store_unittest.cc",
+  ]
+  deps = [
+    ":render_fingerprint_test_support",
+    "//base",
+    "//base/test:run_all_unittests",
+    "//testing/gtest",
+  ]
+}
+
+# Test target for the canvas anti-fraud seed store + algorithm (2026-07-26).
+# Declared unconditionally; the production algorithm itself is gated by the
+# existing enable_canvas_test_noise flag, but the store + algorithm are
+# reachable via --canvas-anti-fraud-seed even when that flag is off.
+test("chromium_fork_anti_fraud_unittests") {
+  sources = [
+    "canvas_anti_fraud_seed_store_unittest.cc",
+    "canvas_anti_fraud_unittest.cc",
+  ]
+  deps = [
+    ":canvas_anti_fraud",
+    ":canvas_anti_fraud_seed_store",
+    ":canvas_session_seed_manager",
+    ":chromium_fork",
+    ":chromium_fork_switches",
+    "//base",
+    "//base/test:run_all_unittests",
+    "//skia",
+    "//testing/gtest",
+  ]
+}
