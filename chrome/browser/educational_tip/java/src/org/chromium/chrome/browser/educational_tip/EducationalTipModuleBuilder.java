@@ -1,0 +1,141 @@
+// Copyright 2024 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+package org.chromium.chrome.browser.educational_tip;
+
+import android.view.LayoutInflater;
+import android.view.ViewGroup;
+
+import org.chromium.base.Callback;
+import org.chromium.base.supplier.MonotonicObservableSupplier;
+import org.chromium.build.annotations.NullMarked;
+import org.chromium.build.annotations.Nullable;
+import org.chromium.chrome.browser.feature_engagement.TrackerFactory;
+import org.chromium.chrome.browser.flags.ChromeFeatureList;
+import org.chromium.chrome.browser.magic_stack.ModuleDelegate;
+import org.chromium.chrome.browser.magic_stack.ModuleDelegate.ModuleType;
+import org.chromium.chrome.browser.magic_stack.ModuleProvider;
+import org.chromium.chrome.browser.magic_stack.ModuleProviderBuilder;
+import org.chromium.chrome.browser.profiles.Profile;
+import org.chromium.chrome.browser.setup_list.SetupListModuleUtils;
+import org.chromium.components.feature_engagement.Tracker;
+import org.chromium.components.segmentation_platform.InputContext;
+import org.chromium.ui.modelutil.PropertyKey;
+import org.chromium.ui.modelutil.PropertyModel;
+
+@NullMarked
+public class EducationalTipModuleBuilder implements ModuleProviderBuilder {
+    private final EducationTipModuleActionDelegate mActionDelegate;
+    private final @ModuleType int mModuleType;
+    private @Nullable Profile mProfile;
+
+    /** Pass in the dependencies needed to build {@link EducationalTipModuleCoordinator}. */
+    public EducationalTipModuleBuilder(
+            @ModuleType int moduleTypeToBuild, EducationTipModuleActionDelegate actionDelegate) {
+        mModuleType = moduleTypeToBuild;
+        mActionDelegate = actionDelegate;
+    }
+
+    /** Build {@link ModuleProvider} for the educational tip module. */
+    @Override
+    public boolean build(
+            ModuleDelegate moduleDelegate, Callback<ModuleProvider> onModuleBuiltCallback) {
+        if (!EducationalTipModuleUtils.isEducationalTipActive()) {
+            return false;
+        }
+
+        if (mModuleType == ModuleType.DEFAULT_BROWSER_PROMO
+                && !ChromeFeatureList.sEducationalTipDefaultBrowserPromoCard.isEnabled()) {
+            return false;
+        }
+
+        EducationalTipModuleCoordinator coordinator =
+                new EducationalTipModuleCoordinator(
+                        mModuleType,
+                        moduleDelegate,
+                        mActionDelegate,
+                        getRegularProfile(mActionDelegate.getProfileSupplier()));
+        onModuleBuiltCallback.onResult(coordinator);
+        return true;
+    }
+
+    /** Create view for the educational tip module. */
+    @Override
+    public ViewGroup createView(ViewGroup parentView) {
+        int layoutId =
+                mModuleType == ModuleType.SETUP_LIST_CELEBRATORY_PROMO
+                        ? R.layout.setup_list_celebratory_promo_layout
+                        : R.layout.educational_tip_module_layout;
+        ViewGroup moduleView =
+                (ViewGroup)
+                        LayoutInflater.from(mActionDelegate.getContext())
+                                .inflate(layoutId, parentView, false);
+
+        if (SetupListModuleUtils.isSetupListModule(mModuleType)) {
+            // Setup List images don't have a background
+            moduleView
+                    .findViewById(R.id.educational_tip_module_content_image)
+                    .setBackgroundResource(0);
+        }
+        return moduleView;
+    }
+
+    /** Bind the property model for the educational tip module. */
+    @Override
+    public void bind(PropertyModel model, ViewGroup view, PropertyKey propertyKey) {
+        EducationalTipModuleViewBinder.bind(model, view, propertyKey);
+    }
+
+    @Override
+    public @Nullable Integer getManualRank() {
+        return SetupListModuleUtils.getManualRank(mModuleType);
+    }
+
+    @Override
+    public boolean isEligible() {
+        if (SetupListModuleUtils.isSetupListActive()) {
+            // While the Setup List is active, it takes priority. Only modules acting as Setup List
+            // items (including dual-purpose ones like Default Browser) are eligible.
+            if (SetupListModuleUtils.isSetupListModule(mModuleType)) {
+                return SetupListModuleUtils.isModuleEligible(mModuleType);
+            }
+            return false;
+        }
+
+        // When the Setup List is inactive, check if Educational Tips are active globally.
+        if (!EducationalTipModuleUtils.isEducationalTipActive()) {
+            return false;
+        }
+
+        // Only standard Educational Tip modules are eligible.
+        return EducationalTipModuleUtils.getModuleTypes().contains(mModuleType);
+    }
+
+    @Override
+    public InputContext createInputContext() {
+        // TODO(crbug.com/469425754): Setup list modules should be omitted from ranking
+        // When the setup list transitions to inactive, the modules are still registered
+        // in the existing session, but don't have a manual rank anymore. As a result they will
+        // be ranked by the segmentation platform, along with other education tip modules.
+        if (SetupListModuleUtils.isSetupListModule(mModuleType)) {
+            return new InputContext();
+        }
+        Profile profile = getRegularProfile(mActionDelegate.getProfileSupplier());
+        Tracker tracker = TrackerFactory.getTrackerForProfile(profile);
+        return EducationalTipCardProviderSignalHandler.createInputContext(
+                mModuleType, mActionDelegate, profile, tracker);
+    }
+
+    /** Gets the regular profile if exists. */
+    private Profile getRegularProfile(MonotonicObservableSupplier<Profile> profileSupplier) {
+        if (mProfile != null) {
+            return mProfile;
+        }
+
+        Profile profile = profileSupplier.get();
+        assert profile != null;
+        mProfile = profile.getOriginalProfile();
+        return mProfile;
+    }
+}
